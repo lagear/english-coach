@@ -149,30 +149,77 @@ conversation_history: list[dict] = []
 # Helpers
 # ---------------------------------------------------------------------------
 
-def transcribe(audio_path: str) -> str:
-    """Run faster-whisper on the given audio file, return transcript text.
-    Reads WAV via soundfile → numpy to avoid PyAV compatibility issues on Python 3.14.
+def _parse_wav(path: str) -> np.ndarray:
+    """Parse a PCM WAV file using pure Python — no PyAV, no soundfile.
+    Walks RIFF chunks to find fmt+data, decodes 16-bit PCM to float32.
     """
-    try:
-        audio_np, sr = sf.read(audio_path, dtype="float32", always_2d=False)
-        # Mix stereo to mono
-        if audio_np.ndim == 2:
-            audio_np = audio_np.mean(axis=1)
-        # Resample to 16kHz if needed (Whisper requires 16kHz)
-        if sr != 16000:
-            ratio = 16000 / sr
-            new_len = int(len(audio_np) * ratio)
-            audio_np = np.interp(
-                np.linspace(0, len(audio_np) - 1, new_len),
-                np.arange(len(audio_np)),
-                audio_np,
-            ).astype(np.float32)
-        input_data = audio_np
-    except Exception as e:
-        print(f"[STT] soundfile read failed ({e}), passing path to faster-whisper")
-        input_data = audio_path
+    with open(path, "rb") as f:
+        raw = f.read()
 
-    segments, _ = whisper_model.transcribe(input_data, language="en")
+    if raw[:4] != b'RIFF' or raw[8:12] != b'WAVE':
+        raise ValueError("Not a RIFF/WAVE file")
+
+    pos, fmt_chunk, data_chunk = 12, None, None
+    while pos + 8 <= len(raw):
+        cid  = raw[pos:pos+4]
+        clen = int.from_bytes(raw[pos+4:pos+8], 'little')
+        cdat = raw[pos+8:pos+8+clen]
+        if cid == b'fmt ':
+            fmt_chunk = cdat
+        elif cid == b'data':
+            data_chunk = cdat
+            break
+        pos += 8 + clen + (clen & 1)  # chunks are word-aligned
+
+    if fmt_chunk is None or data_chunk is None:
+        raise ValueError("Missing fmt or data chunk")
+
+    audio_fmt   = int.from_bytes(fmt_chunk[0:2],  'little')  # 1 = PCM
+    channels    = int.from_bytes(fmt_chunk[2:4],  'little')
+    sample_rate = int.from_bytes(fmt_chunk[4:8],  'little')
+    bit_depth   = int.from_bytes(fmt_chunk[14:16], 'little')
+
+    if audio_fmt != 1 or bit_depth != 16:
+        raise ValueError(f"Unsupported WAV: fmt={audio_fmt} bits={bit_depth}")
+
+    samples = np.frombuffer(data_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+
+    if channels == 2:
+        samples = samples.reshape(-1, 2).mean(axis=1).astype(np.float32)
+
+    if sample_rate != 16000:
+        new_len = int(len(samples) * 16000 / sample_rate)
+        samples = np.interp(
+            np.linspace(0, len(samples) - 1, new_len),
+            np.arange(len(samples)),
+            samples,
+        ).astype(np.float32)
+
+    return samples
+
+
+def transcribe(audio_path: str) -> str:
+    """Run faster-whisper, bypassing PyAV entirely via manual WAV parsing."""
+    try:
+        audio_np = _parse_wav(audio_path)
+        print(f"[STT] Parsed {len(audio_np)/16000:.2f}s of audio via manual WAV decoder")
+    except Exception as e:
+        print(f"[STT] Manual WAV parse failed ({e}) — falling back to soundfile")
+        try:
+            audio_np, sr = sf.read(audio_path, dtype="float32", always_2d=False)
+            if audio_np.ndim == 2:
+                audio_np = audio_np.mean(axis=1)
+            if sr != 16000:
+                new_len = int(len(audio_np) * 16000 / sr)
+                audio_np = np.interp(
+                    np.linspace(0, len(audio_np) - 1, new_len),
+                    np.arange(len(audio_np)),
+                    audio_np,
+                ).astype(np.float32)
+        except Exception as e2:
+            raise RuntimeError(f"All audio decoders failed. WAV: {e} | soundfile: {e2}")
+
+    segments, _ = whisper_model.transcribe(audio_np, language="en")
     return " ".join(s.text for s in segments).strip()
 
 
@@ -257,7 +304,6 @@ async def process(audio: UploadFile = File(...)):
     audio_bytes = await audio.read()
 
     # Sniff magic bytes to detect WebM regardless of content-type header
-    # WebM/EBML magic: 0x1A 0x45 0xDF 0xA3
     if len(audio_bytes) >= 4 and audio_bytes[:4] == b'\x1a\x45\xdf\xa3':
         suffix = ".webm"
 
