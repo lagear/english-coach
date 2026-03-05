@@ -125,6 +125,7 @@ app = FastAPI(title="English Coach API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:5174"],
+    allow_origin_regex=r"http://192\.168\.\d+\.\d+:\d+",  # any LAN IP:port
     allow_methods=["*"],
     allow_headers=["*"],
 )
