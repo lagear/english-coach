@@ -1,0 +1,32 @@
+# Python
+backend/venv/
+backend/__pycache__/
+backend/*.pyc
+backend/.env
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+
+# VAD assets (downloaded manually, not committed)
+frontend/public/bundle.min.js
+frontend/public/vad.worklet.bundle.min.js
+frontend/public/*.onnx
+frontend/public/*.wasm
+frontend/public/*.mjs
+
+# TLS certificates (generated locally with mkcert, never commit)
+certs/
+
+# Kokoro model files (large binaries, downloaded once)
+backend/*.onnx
+backend/*.bin
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
