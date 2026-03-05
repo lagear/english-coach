@@ -11,6 +11,7 @@ export function useCoach() {
   const [error, setError]           = useState(null);
   const audioQueueRef   = useRef([]);
   const isPlayingRef    = useRef(false);
+  const currentAudioRef = useRef(null); // track the playing Audio element
   const vadRef          = useRef(null);
   const statusRef       = useRef(status);
   const processingRef   = useRef(false); // guard against concurrent VAD triggers
@@ -22,6 +23,7 @@ export function useCoach() {
   const playNext = useCallback(() => {
     if (audioQueueRef.current.length === 0) {
       isPlayingRef.current = false;
+      currentAudioRef.current = null;
       setStatus("listening");
       return;
     }
@@ -30,6 +32,7 @@ export function useCoach() {
     const blob = audioQueueRef.current.shift();
     const url  = URL.createObjectURL(blob);
     const audio = new Audio(url);
+    currentAudioRef.current = audio;
     audio.onended = () => {
       URL.revokeObjectURL(url);
       playNext();
@@ -43,6 +46,20 @@ export function useCoach() {
     audioQueueRef.current.push(blob);
     if (!isPlayingRef.current) playNext();
   }, [playNext]);
+
+  // ---------- Stop speaking ----------
+  const stopSpeaking = useCallback(() => {
+    // Pause and discard current audio element
+    if (currentAudioRef.current) {
+      currentAudioRef.current.onended = null; // prevent playNext from firing
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
+    }
+    // Clear pending queue
+    audioQueueRef.current = [];
+    isPlayingRef.current  = false;
+    setStatus("listening");
+  }, []);
 
   // ---------- Send audio to backend ----------
   const processAudio = useCallback(async (float32Audio) => {
@@ -81,8 +98,6 @@ export function useCoach() {
           }
           if (event.type === "tts_chunk") {
             enqueueAudio(event.audio);
-            // Accumulate sentence chunks into the current assistant entry
-            // without waiting for the final "reply" event
             setTranscript((prev) => {
               const last = prev[prev.length - 1];
               if (last?.role === "assistant") {
@@ -91,9 +106,6 @@ export function useCoach() {
               return [...prev, { role: "assistant", text: event.text }];
             });
           }
-          // "reply" event carries the full assembled text — skip it to
-          // avoid duplicating what tts_chunk already built incrementally
-          // if (event.type === "reply") { /* intentionally ignored */ }
         }
       }
     } catch (err) {
@@ -110,7 +122,6 @@ export function useCoach() {
     let cancelled = false;
 
     async function initVAD() {
-      // Wait for window.vad to be available (CDN script may still be loading)
       let attempts = 0;
       while (!window.vad && attempts < 20) {
         await new Promise((r) => setTimeout(r, 200));
@@ -158,16 +169,15 @@ export function useCoach() {
 
   // ---------- Reset ----------
   const reset = useCallback(async () => {
-    audioQueueRef.current = [];
-    isPlayingRef.current  = false;
+    stopSpeaking();
     processingRef.current = false;
     setTranscript([]);
     setError(null);
     setStatus("listening");
     await fetch("/reset", { method: "POST" });
-  }, []);
+  }, [stopSpeaking]);
 
-  return { status, transcript, error, reset };
+  return { status, transcript, error, reset, stopSpeaking };
 }
 
 // ---------- WAV encoder (PCM 16-bit mono) ----------
