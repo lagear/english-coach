@@ -1,0 +1,9 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+python-multipart==0.0.9
+faster-whisper>=1.1.0  # 1.1.0+ supports av>=13 (ffmpeg 7.x compatible)
+requests==2.32.3
+numpy==1.26.4
+# Kokoro TTS — Python 3.13 compatible via ONNX runtime
+kokoro-onnx>=0.5.0
+soundfile
