@@ -1,4 +1,4 @@
-# 🎤 English Coach
+# 🎙 English Coach
 
 A local voice-based English coaching app powered by open-source AI.
 No cloud. No subscriptions. Runs 100% on your Mac.
@@ -7,8 +7,8 @@ No cloud. No subscriptions. Runs 100% on your Mac.
 
 | Layer    | Technology                        |
 |----------|-----------------------------------|
-| STT      | faster-whisper (medium.en)        |
-| LLM      | Ollama + llama3.1:8b              |
+| STT      | faster-whisper (large-v3)         |
+| LLM      | Ollama + llama3.1:70b             |
 | TTS      | Kokoro neural TTS (kokoro-onnx)   |
 | VAD      | @ricky0123/vad-web (Silero)       |
 | Backend  | FastAPI + Python                  |
@@ -16,7 +16,7 @@ No cloud. No subscriptions. Runs 100% on your Mac.
 
 ## Prerequisites
 
-- macOS (Apple Silicon recommended, 32GB RAM)
+- macOS (Apple Silicon recommended, 64GB RAM)
 - Python 3.11+
 - Node.js 18+
 - [Ollama](https://ollama.com) installed
@@ -27,7 +27,7 @@ No cloud. No subscriptions. Runs 100% on your Mac.
 ```bash
 ollama serve
 # In another tab:
-ollama pull llama3.1:8b
+ollama pull llama3.1:70b
 ```
 
 ### 2. Backend
@@ -95,16 +95,35 @@ Open http://localhost:5173 in Chrome or Safari.
 
 All settings live in `backend/.env`:
 
-| Variable            | Default               | Description                          |
-|---------------------|-----------------------|--------------------------------------|
-| `OLLAMA_MODEL`      | `llama3.1:8b`         | Any model available in Ollama        |
-| `WHISPER_MODEL`     | `medium.en`           | Whisper model size                   |
-| `TTS_ENGINE`        | `kokoro`              | `kokoro` or `macos`                  |
-| `TTS_VOICE`         | `af_heart`            | Kokoro voice name                    |
-| `HISTORY_TURNS`     | `10`                  | Conversation turns to keep in context|
-| `PROMPT_FILE`       | `./prompt.txt`        | Path to system prompt file           |
+| Variable            | Current value         | Description                           | RAM needed  |
+|---------------------|-----------------------|---------------------------------------|-------------|
+| `OLLAMA_MODEL`      | `llama3.1:70b`        | Any model available in Ollama         | ~40 GB      |
+| `WHISPER_MODEL`     | `large-v3`            | Whisper model size                    | ~3 GB       |
+| `WHISPER_DEVICE`    | `cpu`                 | `cpu` or `cuda`                       | —           |
+| `TTS_ENGINE`        | `kokoro`              | `kokoro` or `macos`                   | ~300 MB     |
+| `TTS_VOICE`         | `af_heart`            | Kokoro voice name                     | —           |
+| `HISTORY_TURNS`     | `10`                  | Conversation turns to keep in context | —           |
+| `PROMPT_FILE`       | `./prompt.txt`        | Path to system prompt file            | —           |
 
-To customize Jhurema’s behavior, edit `backend/prompt.txt` and restart the backend.
+**RAM reference by Ollama model size:**
+
+| Model              | RAM needed | Recommended for           |
+|--------------------|------------|---------------------------|
+| `llama3.1:8b`      | ~6 GB      | 16 GB Mac                 |
+| `llama3.1:70b`     | ~40 GB     | 64 GB Mac ✅ (current)    |
+| `qwen2.5:72b`      | ~42 GB     | 64 GB Mac (alternative)   |
+| `llama3.1:405b`    | ~230 GB    | Mac Studio (192 GB+)      |
+
+**RAM reference by Whisper model:**
+
+| Model          | RAM needed | Notes                          |
+|----------------|------------|--------------------------------|
+| `tiny.en`      | ~150 MB    | Fast, lower accuracy           |
+| `base.en`      | ~300 MB    | Good for quiet environments    |
+| `medium.en`    | ~1.5 GB    | Good balance                   |
+| `large-v3`     | ~3 GB      | Best accuracy ✅ (current)     |
+
+To customize Jhurema's behavior, edit `backend/prompt.txt` and restart the backend.
 
 ## Troubleshooting
 
@@ -162,7 +181,7 @@ The backend will log `Kokoro model files not found — falling back to macOS 'sa
 
 ### `Dynamic require of "onnxruntime-web/wasm" is not supported`
 
-**Root cause:** `@ricky0123/vad-react` (the npm package) uses CommonJS `require()` internally, which Vite cannot transform when bundling `onnxruntime-web`. This is a fundamental incompatibility between the VAD npm package and Vite’s ES module pipeline.
+**Root cause:** `@ricky0123/vad-react` (the npm package) uses CommonJS `require()` internally, which Vite cannot transform when bundling `onnxruntime-web`. This is a fundamental incompatibility between the VAD npm package and Vite's ES module pipeline.
 
 **Fix:** Do not install `@ricky0123/vad-react` or `@ricky0123/vad-web` via npm. Instead, load the VAD bundle via a local `<script>` tag, which exposes `window.vad` as a global. The ONNX/WASM assets are then fetched from the CDN at runtime using `baseAssetPath` and `onnxWASMBasePath` options.
 
