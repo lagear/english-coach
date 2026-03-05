@@ -9,7 +9,8 @@ import io
 import json
 import tempfile
 import subprocess
-from typing import Generator
+import asyncio
+from typing import AsyncGenerator
 
 import requests
 import numpy as np
@@ -114,7 +115,7 @@ app.add_middleware(
         "https://localhost:5173",
         "https://localhost:5174",
     ],
-    allow_origin_regex=r"https?://192\.168\.\d+\.\d+:\d+",  # http or https, any LAN IP:port
+    allow_origin_regex=r"https?://192\.168\.\d+\.\d+:\d+",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -149,15 +150,42 @@ conversation_history: list[dict] = []
 # ---------------------------------------------------------------------------
 
 def transcribe(audio_path: str) -> str:
-    segments, _ = whisper_model.transcribe(audio_path, language="en")
+    """Run faster-whisper on the given audio file, return transcript text.
+    Reads WAV via soundfile → numpy to avoid PyAV compatibility issues on Python 3.14.
+    """
+    try:
+        audio_np, sr = sf.read(audio_path, dtype="float32", always_2d=False)
+        # Mix stereo to mono
+        if audio_np.ndim == 2:
+            audio_np = audio_np.mean(axis=1)
+        # Resample to 16kHz if needed (Whisper requires 16kHz)
+        if sr != 16000:
+            ratio = 16000 / sr
+            new_len = int(len(audio_np) * ratio)
+            audio_np = np.interp(
+                np.linspace(0, len(audio_np) - 1, new_len),
+                np.arange(len(audio_np)),
+                audio_np,
+            ).astype(np.float32)
+        input_data = audio_np
+    except Exception as e:
+        print(f"[STT] soundfile read failed ({e}), passing path to faster-whisper")
+        input_data = audio_path
+
+    segments, _ = whisper_model.transcribe(input_data, language="en")
     return " ".join(s.text for s in segments).strip()
 
-def stream_llm(messages: list[dict]) -> Generator[str, None, None]:
-    response = requests.post(
-        f"{OLLAMA_HOST}/api/chat",
-        json={"model": OLLAMA_MODEL, "messages": messages, "stream": True},
-        stream=True,
-        timeout=60,
+
+async def stream_llm(messages: list[dict]) -> AsyncGenerator[str, None]:
+    """Stream tokens from Ollama, yield complete sentences as they finish."""
+    response = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: requests.post(
+            f"{OLLAMA_HOST}/api/chat",
+            json={"model": OLLAMA_MODEL, "messages": messages, "stream": True},
+            stream=True,
+            timeout=60,
+        )
     )
     buffer = ""
     sentence_end = re.compile(r"(?<=[.!?])\s+")
@@ -182,6 +210,7 @@ def stream_llm(messages: list[dict]) -> Generator[str, None, None]:
                 yield buffer.strip()
             break
 
+
 def tts_to_bytes(text: str) -> bytes:
     if kokoro_model is not None:
         samples, sample_rate = kokoro_model.create(
@@ -205,6 +234,7 @@ def tts_to_bytes(text: str) -> bytes:
             try: os.unlink(p)
             except FileNotFoundError: pass
 
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -213,10 +243,29 @@ def tts_to_bytes(text: str) -> bytes:
 async def process(audio: UploadFile = File(...)):
     import base64
 
-    suffix = ".webm" if "webm" in (audio.content_type or "") else ".wav"
+    content_type = audio.content_type or ""
+    filename = audio.filename or ""
+    if "webm" in content_type or "webm" in filename:
+        suffix = ".webm"
+    elif "mp4" in content_type or "mp4" in filename or "m4a" in filename:
+        suffix = ".mp4"
+    elif "ogg" in content_type or "ogg" in filename:
+        suffix = ".ogg"
+    else:
+        suffix = ".wav"
+
+    audio_bytes = await audio.read()
+
+    # Sniff magic bytes to detect WebM regardless of content-type header
+    # WebM/EBML magic: 0x1A 0x45 0xDF 0xA3
+    if len(audio_bytes) >= 4 and audio_bytes[:4] == b'\x1a\x45\xdf\xa3':
+        suffix = ".webm"
+
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(await audio.read())
+        tmp.write(audio_bytes)
         tmp_path = tmp.name
+
+    print(f"[STT] Received audio: content_type={content_type!r}, suffix={suffix}, size={len(audio_bytes)}B")
 
     user_text = transcribe(tmp_path)
     os.unlink(tmp_path)
@@ -228,7 +277,7 @@ async def process(audio: UploadFile = File(...)):
         print(f"[SECURITY] Injection attempt blocked: {user_text!r}")
         conversation_history.clear()
 
-        def deflection_stream():
+        async def deflection_stream():
             yield f"data: {json.dumps({'type': 'transcript', 'text': user_text})}\n\n"
             wav_bytes = tts_to_bytes(INJECTION_DEFLECTION)
             audio_b64 = base64.b64encode(wav_bytes).decode()
@@ -245,10 +294,10 @@ async def process(audio: UploadFile = File(...)):
 
     full_reply = []
 
-    def event_stream():
+    async def event_stream():
         yield f"data: {json.dumps({'type': 'transcript', 'text': user_text})}\n\n"
 
-        for sentence in stream_llm(messages):
+        async for sentence in stream_llm(messages):
             full_reply.append(sentence)
             wav_bytes = tts_to_bytes(sentence)
             audio_b64 = base64.b64encode(wav_bytes).decode()
