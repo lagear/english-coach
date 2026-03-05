@@ -9,10 +9,11 @@ export function useCoach() {
   const [status, setStatus]         = useState("idle");
   const [transcript, setTranscript] = useState([]);
   const [error, setError]           = useState(null);
-  const audioQueueRef = useRef([]);
-  const isPlayingRef  = useRef(false);
-  const vadRef        = useRef(null);
-  const statusRef     = useRef(status);
+  const audioQueueRef   = useRef([]);
+  const isPlayingRef    = useRef(false);
+  const vadRef          = useRef(null);
+  const statusRef       = useRef(status);
+  const processingRef   = useRef(false); // guard against concurrent VAD triggers
 
   // Keep statusRef in sync so VAD callbacks can read latest value
   useEffect(() => { statusRef.current = status; }, [status]);
@@ -45,6 +46,9 @@ export function useCoach() {
 
   // ---------- Send audio to backend ----------
   const processAudio = useCallback(async (float32Audio) => {
+    // Drop the call if a request is already in flight
+    if (processingRef.current) return;
+    processingRef.current = true;
     setStatus("processing");
     setError(null);
 
@@ -77,6 +81,8 @@ export function useCoach() {
           }
           if (event.type === "tts_chunk") {
             enqueueAudio(event.audio);
+            // Accumulate sentence chunks into the current assistant entry
+            // without waiting for the final "reply" event
             setTranscript((prev) => {
               const last = prev[prev.length - 1];
               if (last?.role === "assistant") {
@@ -85,12 +91,17 @@ export function useCoach() {
               return [...prev, { role: "assistant", text: event.text }];
             });
           }
+          // "reply" event carries the full assembled text — skip it to
+          // avoid duplicating what tts_chunk already built incrementally
+          // if (event.type === "reply") { /* intentionally ignored */ }
         }
       }
     } catch (err) {
       console.error(err);
       setError(err.message);
       setStatus("listening");
+    } finally {
+      processingRef.current = false;
     }
   }, [enqueueAudio]);
 
@@ -149,6 +160,7 @@ export function useCoach() {
   const reset = useCallback(async () => {
     audioQueueRef.current = [];
     isPlayingRef.current  = false;
+    processingRef.current = false;
     setTranscript([]);
     setError(null);
     setStatus("listening");
