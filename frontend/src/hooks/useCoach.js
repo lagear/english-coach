@@ -16,7 +16,6 @@ export function useCoach() {
   const statusRef       = useRef(status);
   const processingRef   = useRef(false); // guard against concurrent VAD triggers
 
-  // Keep statusRef in sync so VAD callbacks can read latest value
   useEffect(() => { statusRef.current = status; }, [status]);
 
   // ---------- Audio playback queue ----------
@@ -50,7 +49,7 @@ export function useCoach() {
   // ---------- Stop speaking ----------
   const stopSpeaking = useCallback(() => {
     if (currentAudioRef.current) {
-      currentAudioRef.current.onended = null; // prevent playNext from firing
+      currentAudioRef.current.onended = null;
       currentAudioRef.current.pause();
       currentAudioRef.current = null;
     }
@@ -59,9 +58,67 @@ export function useCoach() {
     setStatus("listening");
   }, []);
 
-  // ---------- Send audio to backend ----------
+  // ---------- Shared SSE reader ----------
+  const _readSSEStream = useCallback(async (res) => {
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const event = JSON.parse(line.slice(6));
+
+        if (event.type === "transcript") {
+          setTranscript((prev) => [...prev, { role: "user", text: event.text }]);
+        }
+        if (event.type === "tts_chunk") {
+          enqueueAudio(event.audio);
+          setTranscript((prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant") {
+              return [...prev.slice(0, -1), { role: "assistant", text: last.text + " " + event.text }];
+            }
+            return [...prev, { role: "assistant", text: event.text }];
+          });
+        }
+      }
+    }
+  }, [enqueueAudio]);
+
+  // ---------- Send typed text ----------
+  const sendText = useCallback(async (text) => {
+    if (processingRef.current || !text.trim()) return;
+    processingRef.current = true;
+    setStatus("processing");
+    setError(null);
+
+    try {
+      const res = await fetch("/process-text", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
+      await _readSSEStream(res);
+    } catch (err) {
+      console.error(err);
+      setError(err.message);
+      setStatus("listening");
+    } finally {
+      processingRef.current = false;
+    }
+  }, [_readSSEStream]);
+
+  // ---------- Send audio ----------
   const processAudio = useCallback(async (float32Audio) => {
-    // Drop the call if a request is already in flight
     if (processingRef.current) return;
     processingRef.current = true;
     setStatus("processing");
@@ -74,38 +131,7 @@ export function useCoach() {
 
       const res = await fetch("/process", { method: "POST", body: form });
       if (!res.ok) throw new Error(`Server error ${res.status}`);
-
-      const reader  = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        const lines = buffer.split("\n");
-        buffer = lines.pop();
-
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const event = JSON.parse(line.slice(6));
-
-          if (event.type === "transcript") {
-            setTranscript((prev) => [...prev, { role: "user", text: event.text }]);
-          }
-          if (event.type === "tts_chunk") {
-            enqueueAudio(event.audio);
-            setTranscript((prev) => {
-              const last = prev[prev.length - 1];
-              if (last?.role === "assistant") {
-                return [...prev.slice(0, -1), { role: "assistant", text: last.text + " " + event.text }];
-              }
-              return [...prev, { role: "assistant", text: event.text }];
-            });
-          }
-        }
-      }
+      await _readSSEStream(res);
     } catch (err) {
       console.error(err);
       setError(err.message);
@@ -113,9 +139,9 @@ export function useCoach() {
     } finally {
       processingRef.current = false;
     }
-  }, [enqueueAudio]);
+  }, [_readSSEStream]);
 
-  // ---------- Init VAD from CDN global window.vad ----------
+  // ---------- Init VAD ----------
   useEffect(() => {
     let cancelled = false;
 
@@ -175,7 +201,7 @@ export function useCoach() {
     await fetch("/reset", { method: "POST" });
   }, [stopSpeaking]);
 
-  return { status, transcript, error, reset, stopSpeaking };
+  return { status, transcript, error, reset, stopSpeaking, sendText };
 }
 
 // ---------- WAV encoder (PCM 16-bit mono) ----------
