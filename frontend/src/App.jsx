@@ -2,9 +2,11 @@ import { useCoach } from "./hooks/useCoach";
 import VoiceOrb   from "./components/VoiceOrb";
 import Transcript  from "./components/Transcript";
 import StatusBar   from "./components/StatusBar";
+import TextInput   from "./components/TextInput";
 
 export default function App() {
-  const { status, transcript, error, reset, stopSpeaking } = useCoach();
+  const { status, transcript, error, reset, stopSpeaking, sendText } = useCoach();
+  const busy = status === "processing" || status === "speaking";
 
   return (
     <div className="app">
@@ -20,14 +22,17 @@ export default function App() {
       </main>
 
       <footer className="app__footer">
-        {status === "speaking" && (
-          <button className="btn-stop" onClick={stopSpeaking}>
-            ■ Stop
+        <TextInput onSend={sendText} disabled={busy} />
+        <div className="app__footer-actions">
+          {status === "speaking" && (
+            <button className="btn-stop" onClick={stopSpeaking}>
+              &#9632; Stop
+            </button>
+          )}
+          <button className="btn-reset" onClick={reset}>
+            New conversation
           </button>
-        )}
-        <button className="btn-reset" onClick={reset}>
-          New conversation
-        </button>
+        </div>
       </footer>
     </div>
   );
