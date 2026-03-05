@@ -26,13 +26,14 @@ OLLAMA_HOST  = os.getenv("OLLAMA_HOST",   "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL",  "llama3.1:8b")
 WHISPER_MODEL  = os.getenv("WHISPER_MODEL",  "medium.en")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
-TTS_ENGINE = os.getenv("TTS_ENGINE", "kokoro")
-TTS_VOICE  = os.getenv("TTS_VOICE",  "af_heart")
+TTS_ENGINE = os.getenv("TTS_ENGINE", "kokoro")       # "kokoro" | "macos"
+TTS_VOICE  = os.getenv("TTS_VOICE",  "af_heart")     # Kokoro voice name
 KOKORO_MODEL_PATH  = os.getenv("KOKORO_MODEL_PATH",  "./kokoro-v1.0.onnx")
 KOKORO_VOICES_PATH = os.getenv("KOKORO_VOICES_PATH", "./voices-v1.0.bin")
 HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "10"))
 PROMPT_FILE   = os.getenv("PROMPT_FILE", "./prompt.txt")
 
+# Load system prompt from file if available, otherwise use inline default
 _inline_prompt = """You are Jhurema, a friendly and encouraging native American English conversation partner.
 Your student is at a B2 (Upper-Intermediate) English level. Your goal is to help them practice natural, fluent English.
 
@@ -73,8 +74,15 @@ except FileNotFoundError:
 # ---------------------------------------------------------------------------
 # Prompt injection defense
 # ---------------------------------------------------------------------------
+
+# Deflection response spoken by Jhurema when injection is detected
 INJECTION_DEFLECTION = "Let's keep focused on practicing English together! What would you like to talk about?"
 
+# Patterns covering the four main injection vectors:
+#   1. Instruction override  — "ignore/disregard/forget previous instructions"
+#   2. Persona replacement   — "you are now / act as / pretend to be"
+#   3. Prompt extraction     — "repeat/reveal/show your instructions/system prompt"
+#   4. Hypothetical framing  — "in a world where / imagine you have no rules"
 _INJECTION_PATTERNS: list[re.Pattern] = [
     re.compile(p, re.IGNORECASE) for p in [
         r"ignore\s+(all\s+)?(previous|prior|above|your)\s+instructions",
@@ -95,11 +103,19 @@ _INJECTION_PATTERNS: list[re.Pattern] = [
     ]
 ]
 
+
 def detect_injection(text: str) -> bool:
+    """Return True if the transcribed text contains a prompt injection attempt."""
     return any(p.search(text) for p in _INJECTION_PATTERNS)
 
+
 def wrap_user_input(text: str) -> str:
+    """
+    Wrap user text in XML tags so the LLM structurally separates
+    student speech from system instructions.
+    """
     return f"<user_input>{text}</user_input>"
+
 
 # ---------------------------------------------------------------------------
 # App + CORS
@@ -108,13 +124,8 @@ app = FastAPI(title="English Coach API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "https://localhost:5173",
-        "https://localhost:5174",
-    ],
-    allow_origin_regex=r"https?://192\.168\.\d+\.\d+:\d+",  # http or https, any LAN IP:port
+    allow_origins=["http://localhost:5173", "http://localhost:5174"],
+    allow_origin_regex=r"http://192\.168\.\d+\.\d+:\d+",  # any LAN IP:port
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -139,20 +150,26 @@ if TTS_ENGINE == "kokoro":
         print(f"Kokoro ready  (voice: {TTS_VOICE})")
     except FileNotFoundError:
         print("Kokoro model files not found — falling back to macOS 'say'.")
+        print("Run the download commands in the README to enable Kokoro TTS.")
     except Exception as e:
         print(f"Kokoro failed to load ({e}) — falling back to macOS 'say'.")
 
+# In-memory conversation history (resets on server restart)
 conversation_history: list[dict] = []
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def transcribe(audio_path: str) -> str:
+    """Run faster-whisper on the given audio file, return transcript text."""
     segments, _ = whisper_model.transcribe(audio_path, language="en")
     return " ".join(s.text for s in segments).strip()
 
+
 def stream_llm(messages: list[dict]) -> Generator[str, None, None]:
+    """Stream tokens from Ollama, yield complete sentences as they finish."""
     response = requests.post(
         f"{OLLAMA_HOST}/api/chat",
         json={"model": OLLAMA_MODEL, "messages": messages, "stream": True},
@@ -182,28 +199,48 @@ def stream_llm(messages: list[dict]) -> Generator[str, None, None]:
                 yield buffer.strip()
             break
 
+
 def tts_to_bytes(text: str) -> bytes:
+    """
+    Convert text to WAV bytes.
+    Uses Kokoro neural TTS when model is loaded, falls back to macOS say.
+    """
+    # Kokoro neural TTS
     if kokoro_model is not None:
         samples, sample_rate = kokoro_model.create(
-            text, voice=TTS_VOICE, speed=1.0, lang="en-us",
+            text,
+            voice=TTS_VOICE,
+            speed=1.0,
+            lang="en-us",
         )
         buf = io.BytesIO()
         sf.write(buf, samples, sample_rate, format="WAV")
         return buf.getvalue()
 
+    # macOS say fallback
     with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as f:
         aiff_path = f.name
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         wav_path = f.name
+
     try:
-        subprocess.run(["say", "-v", "Samantha", "-o", aiff_path, text], check=True, capture_output=True)
-        subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16", aiff_path, wav_path], check=True, capture_output=True)
+        subprocess.run(
+            ["say", "-v", "Samantha", "-o", aiff_path, text],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["afconvert", "-f", "WAVE", "-d", "LEI16", aiff_path, wav_path],
+            check=True, capture_output=True,
+        )
         with open(wav_path, "rb") as f:
             return f.read()
     finally:
         for p in (aiff_path, wav_path):
-            try: os.unlink(p)
-            except FileNotFoundError: pass
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -211,6 +248,15 @@ def tts_to_bytes(text: str) -> bytes:
 
 @app.post("/process")
 async def process(audio: UploadFile = File(...)):
+    """
+    Main pipeline endpoint.
+    Accepts: audio file (wav)
+    Returns: SSE stream of JSON events:
+      {"type": "transcript", "text": "..."}
+      {"type": "tts_chunk",  "audio": "<base64 WAV>"}
+      {"type": "reply",      "text": "..."}
+      {"type": "done"}
+    """
     import base64
 
     suffix = ".webm" if "webm" in (audio.content_type or "") else ".wav"
@@ -224,9 +270,10 @@ async def process(audio: UploadFile = File(...)):
     if not user_text:
         return JSONResponse({"error": "Could not understand audio"}, status_code=422)
 
+    # ── Prompt injection defense ──────────────────────────────────────────────────────────────────────────
     if detect_injection(user_text):
         print(f"[SECURITY] Injection attempt blocked: {user_text!r}")
-        conversation_history.clear()
+        conversation_history.clear()  # Reset potentially poisoned history
 
         def deflection_stream():
             yield f"data: {json.dumps({'type': 'transcript', 'text': user_text})}\n\n"
@@ -237,8 +284,11 @@ async def process(audio: UploadFile = File(...)):
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
         return StreamingResponse(deflection_stream(), media_type="text/event-stream")
+    # ────────────────────────────────────────────────────────────────────────────
 
+    # Wrap user input in XML tags to structurally isolate it from instructions
     safe_user_content = wrap_user_input(user_text)
+
     conversation_history.append({"role": "user", "content": safe_user_content})
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages += conversation_history[-(HISTORY_TURNS * 2):]
@@ -264,6 +314,7 @@ async def process(audio: UploadFile = File(...)):
 
 @app.post("/reset")
 def reset():
+    """Clear conversation history."""
     conversation_history.clear()
     return {"status": "ok", "message": "Conversation reset"}
 

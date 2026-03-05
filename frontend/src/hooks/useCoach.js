@@ -2,10 +2,6 @@
  * useCoach — core logic hook
  * VAD is loaded from CDN as window.vad (avoids Vite/ONNX bundling issues)
  * States: idle | listening | processing | speaking
- *
- * Safari/iOS note: AudioContext must be resumed inside a user gesture.
- * We create it lazily on first VAD speech detection (which itself follows
- * the user tapping "allow microphone"), so it is always inside a gesture.
  */
 import { useState, useRef, useCallback, useEffect } from "react";
 
@@ -17,23 +13,12 @@ export function useCoach() {
   const isPlayingRef    = useRef(false);
   const vadRef          = useRef(null);
   const statusRef       = useRef(status);
-  const processingRef   = useRef(false);
-  const audioCtxRef     = useRef(null);  // shared AudioContext (Safari-safe)
+  const processingRef   = useRef(false); // guard against concurrent VAD triggers
 
+  // Keep statusRef in sync so VAD callbacks can read latest value
   useEffect(() => { statusRef.current = status; }, [status]);
 
-  // ---------- AudioContext — created once, resumed on first use ----------
-  const getAudioContext = useCallback(() => {
-    if (!audioCtxRef.current) {
-      audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    if (audioCtxRef.current.state === "suspended") {
-      audioCtxRef.current.resume();
-    }
-    return audioCtxRef.current;
-  }, []);
-
-  // ---------- Audio playback queue (AudioContext-based, Safari-safe) ----------
+  // ---------- Audio playback queue ----------
   const playNext = useCallback(() => {
     if (audioQueueRef.current.length === 0) {
       isPlayingRef.current = false;
@@ -42,37 +27,28 @@ export function useCoach() {
     }
     isPlayingRef.current = true;
     setStatus("speaking");
+    const blob = audioQueueRef.current.shift();
+    const url  = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.onended = () => {
+      URL.revokeObjectURL(url);
+      playNext();
+    };
+    audio.play().catch(console.error);
+  }, []);
 
-    const { buffer: audioBuffer } = audioQueueRef.current.shift();
-    const ctx = getAudioContext();
-    const source = ctx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(ctx.destination);
-    source.onended = () => playNext();
-    source.start();
-  }, [getAudioContext]);
-
-  const enqueueAudio = useCallback(async (base64str) => {
+  const enqueueAudio = useCallback((base64str) => {
     const bytes = Uint8Array.from(atob(base64str), (c) => c.charCodeAt(0));
-    const ctx = getAudioContext();
-    try {
-      const audioBuffer = await ctx.decodeAudioData(bytes.buffer);
-      audioQueueRef.current.push({ buffer: audioBuffer });
-      if (!isPlayingRef.current) playNext();
-    } catch (err) {
-      console.error("Audio decode error:", err);
-    }
-  }, [getAudioContext, playNext]);
+    const blob  = new Blob([bytes], { type: "audio/wav" });
+    audioQueueRef.current.push(blob);
+    if (!isPlayingRef.current) playNext();
+  }, [playNext]);
 
   // ---------- Send audio to backend ----------
   const processAudio = useCallback(async (float32Audio) => {
+    // Drop the call if a request is already in flight
     if (processingRef.current) return;
     processingRef.current = true;
-
-    // Resume AudioContext here — inside VAD callback which follows user
-    // granting mic permission, close enough to a gesture for Safari.
-    getAudioContext();
-
     setStatus("processing");
     setError(null);
 
@@ -105,6 +81,8 @@ export function useCoach() {
           }
           if (event.type === "tts_chunk") {
             enqueueAudio(event.audio);
+            // Accumulate sentence chunks into the current assistant entry
+            // without waiting for the final "reply" event
             setTranscript((prev) => {
               const last = prev[prev.length - 1];
               if (last?.role === "assistant") {
@@ -113,7 +91,9 @@ export function useCoach() {
               return [...prev, { role: "assistant", text: event.text }];
             });
           }
-          // "reply" event intentionally ignored — tts_chunk builds transcript incrementally
+          // "reply" event carries the full assembled text — skip it to
+          // avoid duplicating what tts_chunk already built incrementally
+          // if (event.type === "reply") { /* intentionally ignored */ }
         }
       }
     } catch (err) {
@@ -123,13 +103,14 @@ export function useCoach() {
     } finally {
       processingRef.current = false;
     }
-  }, [enqueueAudio, getAudioContext]);
+  }, [enqueueAudio]);
 
   // ---------- Init VAD from CDN global window.vad ----------
   useEffect(() => {
     let cancelled = false;
 
     async function initVAD() {
+      // Wait for window.vad to be available (CDN script may still be loading)
       let attempts = 0;
       while (!window.vad && attempts < 20) {
         await new Promise((r) => setTimeout(r, 200));
