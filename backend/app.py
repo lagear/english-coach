@@ -9,8 +9,7 @@ import io
 import json
 import tempfile
 import subprocess
-import asyncio
-from typing import AsyncGenerator
+from typing import Generator
 
 import requests
 import numpy as np
@@ -115,7 +114,7 @@ app.add_middleware(
         "https://localhost:5173",
         "https://localhost:5174",
     ],
-    allow_origin_regex=r"https?://192\.168\.\d+\.\d+:\d+",
+    allow_origin_regex=r"https?://192\.168\.\d+\.\d+:\d+",  # http or https, any LAN IP:port
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -149,90 +148,16 @@ conversation_history: list[dict] = []
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _parse_wav(path: str) -> np.ndarray:
-    """Parse a PCM WAV file using pure Python — no PyAV, no soundfile.
-    Walks RIFF chunks to find fmt+data, decodes 16-bit PCM to float32.
-    """
-    with open(path, "rb") as f:
-        raw = f.read()
-
-    if raw[:4] != b'RIFF' or raw[8:12] != b'WAVE':
-        raise ValueError("Not a RIFF/WAVE file")
-
-    pos, fmt_chunk, data_chunk = 12, None, None
-    while pos + 8 <= len(raw):
-        cid  = raw[pos:pos+4]
-        clen = int.from_bytes(raw[pos+4:pos+8], 'little')
-        cdat = raw[pos+8:pos+8+clen]
-        if cid == b'fmt ':
-            fmt_chunk = cdat
-        elif cid == b'data':
-            data_chunk = cdat
-            break
-        pos += 8 + clen + (clen & 1)  # chunks are word-aligned
-
-    if fmt_chunk is None or data_chunk is None:
-        raise ValueError("Missing fmt or data chunk")
-
-    audio_fmt   = int.from_bytes(fmt_chunk[0:2],  'little')  # 1 = PCM
-    channels    = int.from_bytes(fmt_chunk[2:4],  'little')
-    sample_rate = int.from_bytes(fmt_chunk[4:8],  'little')
-    bit_depth   = int.from_bytes(fmt_chunk[14:16], 'little')
-
-    if audio_fmt != 1 or bit_depth != 16:
-        raise ValueError(f"Unsupported WAV: fmt={audio_fmt} bits={bit_depth}")
-
-    samples = np.frombuffer(data_chunk, dtype=np.int16).astype(np.float32) / 32768.0
-
-    if channels == 2:
-        samples = samples.reshape(-1, 2).mean(axis=1).astype(np.float32)
-
-    if sample_rate != 16000:
-        new_len = int(len(samples) * 16000 / sample_rate)
-        samples = np.interp(
-            np.linspace(0, len(samples) - 1, new_len),
-            np.arange(len(samples)),
-            samples,
-        ).astype(np.float32)
-
-    return samples
-
-
 def transcribe(audio_path: str) -> str:
-    """Run faster-whisper, bypassing PyAV entirely via manual WAV parsing."""
-    try:
-        audio_np = _parse_wav(audio_path)
-        print(f"[STT] Parsed {len(audio_np)/16000:.2f}s of audio via manual WAV decoder")
-    except Exception as e:
-        print(f"[STT] Manual WAV parse failed ({e}) — falling back to soundfile")
-        try:
-            audio_np, sr = sf.read(audio_path, dtype="float32", always_2d=False)
-            if audio_np.ndim == 2:
-                audio_np = audio_np.mean(axis=1)
-            if sr != 16000:
-                new_len = int(len(audio_np) * 16000 / sr)
-                audio_np = np.interp(
-                    np.linspace(0, len(audio_np) - 1, new_len),
-                    np.arange(len(audio_np)),
-                    audio_np,
-                ).astype(np.float32)
-        except Exception as e2:
-            raise RuntimeError(f"All audio decoders failed. WAV: {e} | soundfile: {e2}")
-
-    segments, _ = whisper_model.transcribe(audio_np, language="en")
+    segments, _ = whisper_model.transcribe(audio_path, language="en")
     return " ".join(s.text for s in segments).strip()
 
-
-async def stream_llm(messages: list[dict]) -> AsyncGenerator[str, None]:
-    """Stream tokens from Ollama, yield complete sentences as they finish."""
-    response = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: requests.post(
-            f"{OLLAMA_HOST}/api/chat",
-            json={"model": OLLAMA_MODEL, "messages": messages, "stream": True},
-            stream=True,
-            timeout=60,
-        )
+def stream_llm(messages: list[dict]) -> Generator[str, None, None]:
+    response = requests.post(
+        f"{OLLAMA_HOST}/api/chat",
+        json={"model": OLLAMA_MODEL, "messages": messages, "stream": True},
+        stream=True,
+        timeout=60,
     )
     buffer = ""
     sentence_end = re.compile(r"(?<=[.!?])\s+")
@@ -257,7 +182,6 @@ async def stream_llm(messages: list[dict]) -> AsyncGenerator[str, None]:
                 yield buffer.strip()
             break
 
-
 def tts_to_bytes(text: str) -> bytes:
     if kokoro_model is not None:
         samples, sample_rate = kokoro_model.create(
@@ -281,7 +205,6 @@ def tts_to_bytes(text: str) -> bytes:
             try: os.unlink(p)
             except FileNotFoundError: pass
 
-
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -290,28 +213,10 @@ def tts_to_bytes(text: str) -> bytes:
 async def process(audio: UploadFile = File(...)):
     import base64
 
-    content_type = audio.content_type or ""
-    filename = audio.filename or ""
-    if "webm" in content_type or "webm" in filename:
-        suffix = ".webm"
-    elif "mp4" in content_type or "mp4" in filename or "m4a" in filename:
-        suffix = ".mp4"
-    elif "ogg" in content_type or "ogg" in filename:
-        suffix = ".ogg"
-    else:
-        suffix = ".wav"
-
-    audio_bytes = await audio.read()
-
-    # Sniff magic bytes to detect WebM regardless of content-type header
-    if len(audio_bytes) >= 4 and audio_bytes[:4] == b'\x1a\x45\xdf\xa3':
-        suffix = ".webm"
-
+    suffix = ".webm" if "webm" in (audio.content_type or "") else ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(audio_bytes)
+        tmp.write(await audio.read())
         tmp_path = tmp.name
-
-    print(f"[STT] Received audio: content_type={content_type!r}, suffix={suffix}, size={len(audio_bytes)}B")
 
     user_text = transcribe(tmp_path)
     os.unlink(tmp_path)
@@ -323,7 +228,7 @@ async def process(audio: UploadFile = File(...)):
         print(f"[SECURITY] Injection attempt blocked: {user_text!r}")
         conversation_history.clear()
 
-        async def deflection_stream():
+        def deflection_stream():
             yield f"data: {json.dumps({'type': 'transcript', 'text': user_text})}\n\n"
             wav_bytes = tts_to_bytes(INJECTION_DEFLECTION)
             audio_b64 = base64.b64encode(wav_bytes).decode()
@@ -340,10 +245,10 @@ async def process(audio: UploadFile = File(...)):
 
     full_reply = []
 
-    async def event_stream():
+    def event_stream():
         yield f"data: {json.dumps({'type': 'transcript', 'text': user_text})}\n\n"
 
-        async for sentence in stream_llm(messages):
+        for sentence in stream_llm(messages):
             full_reply.append(sentence)
             wav_bytes = tts_to_bytes(sentence)
             audio_b64 = base64.b64encode(wav_bytes).decode()
